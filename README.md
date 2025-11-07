@@ -3,7 +3,7 @@
 
 ---
 
-### 👩‍💻 Aluna
+### 👩‍💻 Aluno
 **Danilo Trigo**  
 **Curso:** Ciência da Computação — UERJ  
 **Disciplina:** Sistemas Distribuídos  
@@ -78,5 +78,6 @@ Nó local: 127.0.0.1:550xx
 | `/history`  | exibe o histórico causal convergente |
 | `/elect`    | força uma eleição manual             |
 | `/leave`    | encerra o nó local                   |
+
 
 

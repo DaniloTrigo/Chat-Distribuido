@@ -7,6 +7,7 @@ from datetime import datetime
 import pickle
 import random
 import os, uuid
+import struct  # <-- necessário para IP_ADD_MEMBERSHIP no Windows
 
 class ChatNode:
     def __init__(self, multicast_group='224.0.0.1', multicast_port=5007, tcp_port=None):
@@ -94,14 +95,22 @@ class ChatNode:
 
     # ------------------------ util ------------------------
     def _get_local_ip(self):
+        # Permite forçar a interface via variável de ambiente (útil no Windows/VPN):
+        #   set CHAT_IFACE=192.168.x.x
+        forced = os.getenv("CHAT_IFACE")
+        if forced and forced.strip():
+            return forced.strip()
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.connect(("8.8.8.8", 80))
             ip = s.getsockname()[0]
             s.close()
+            if ip.startswith("127."):
+                raise RuntimeError("loopback")
             return ip
         except:
-            return "127.0.0.1"
+            # último recurso — pode falhar para multicast em alguns hosts
+            return "0.0.0.0"
 
     def _find_free_port(self):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -135,12 +144,50 @@ class ChatNode:
 
     # ------------------------ sockets ------------------------
     def setup_multicast(self):
-        self.multicast_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # Socket UDP para multicast
+        self.multicast_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
         self.multicast_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+        # Bind na porta do grupo (todas interfaces)
         self.multicast_sock.bind(('', self.multicast_port))
-        mreq = socket.inet_aton(self.multicast_group) + socket.inet_aton('0.0.0.0')
-        self.multicast_sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
-        self.multicast_sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+
+        # Escolha/descoberta de interface de saída
+        iface_ip = self.local_ip
+        if not iface_ip or iface_ip.startswith("0.") or iface_ip.startswith("127."):
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.connect(("224.0.0.1", 7))
+                iface_ip = s.getsockname()[0]
+                s.close()
+            except:
+                iface_ip = "0.0.0.0"
+
+        group = socket.inet_aton(self.multicast_group)
+        iface = socket.inet_aton(iface_ip)
+
+        # Define interface para ENVIAR multicast
+        try:
+            self.multicast_sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, iface)
+        except OSError:
+            pass
+
+        # Entra no grupo na interface escolhida (Windows precisa disso)
+        try:
+            mreq = struct.pack('=4s4s', group, iface)
+            self.multicast_sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+        except OSError:
+            # Fallback: tenta wildcard 0.0.0.0
+            mreq_any = struct.pack('=4s4s', group, socket.inet_aton('0.0.0.0'))
+            self.multicast_sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq_any)
+
+        # TTL e loopback (úteis em testes locais)
+        try:
+            self.multicast_sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+            self.multicast_sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 1)
+        except OSError:
+            pass
+
+        print(f"[INFO] Multicast na interface {iface_ip} → {self.multicast_group}:{self.multicast_port}")
 
     def setup_tcp(self):
         self.tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

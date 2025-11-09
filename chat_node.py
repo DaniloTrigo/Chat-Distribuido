@@ -6,6 +6,7 @@ import sys
 from datetime import datetime
 import pickle
 import random
+import os, uuid
 
 class ChatNode:
     def __init__(self, multicast_group='224.0.0.1', multicast_port=5007, tcp_port=None):
@@ -21,12 +22,14 @@ class ChatNode:
 
         # Tabela de nós: {node_id: (ip, tcp_port, last_seen)}
         self.nodes = {}
+        # Dono anterior conhecido (opcional, p/ reforçar devolução de ID)
+        self.last_owner = {}
 
         # Mensagens / locks
         self.message_history = []
         self.message_lock = threading.Lock()
 
-        # Heartbeats
+        # Heartbeats / presença
         self.last_heartbeat = time.time()
         self.heartbeat_interval = 2.0           # envio de HB do coordenador
         self.peer_alive_interval = 2.0          # envio de NODE_ALIVE por todos
@@ -46,6 +49,48 @@ class ChatNode:
         self.tcp_sock = None
         self.running = True
         self.local_ip = self._get_local_ip()
+
+        # Persistência leve (identidade e histórico local)
+        self.state_path   = f"state_{self.tcp_port}.json"     # identidade e último node_id
+        self.history_path = f"history_{self.tcp_port}.jsonl"  # histórico local
+        self.node_uuid    = None
+        self.desired_id   = None
+        self.last_delivered_ts = 0.0
+        self._load_state()
+
+    # ------------------------ persistência ------------------------
+    def _load_state(self):
+        try:
+            if os.path.exists(self.state_path):
+                st = json.load(open(self.state_path, "r", encoding="utf-8"))
+                self.node_uuid  = st.get("node_uuid")
+                self.desired_id = st.get("last_node_id")
+            if not self.node_uuid:
+                self.node_uuid = str(uuid.uuid4())
+                self.desired_id = None
+                self._save_state()
+        except Exception:
+            self.node_uuid = str(uuid.uuid4())
+            self.desired_id = None
+            self._save_state()
+
+    def _save_state(self):
+        try:
+            json.dump(
+                {"node_uuid": self.node_uuid, "last_node_id": self.node_id},
+                open(self.state_path, "w", encoding="utf-8"),
+                ensure_ascii=False, indent=2
+            )
+        except Exception:
+            pass
+
+    def _append_history_local(self, msg):
+        try:
+            with open(self.history_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+            self.last_delivered_ts = max(self.last_delivered_ts, msg.get("timestamp", 0.0))
+        except Exception:
+            pass
 
     # ------------------------ util ------------------------
     def _get_local_ip(self):
@@ -67,10 +112,10 @@ class ChatNode:
     def _now_str(self):
         return datetime.now().strftime("%H:%M:%S")
 
-    def _mark_seen(self, nid):
+    def _mark_seen(self, nid, ts=None):
         if nid in self.nodes:
             ip, port, _ = self.nodes[nid]
-            self.nodes[nid] = (ip, port, time.time())
+            self.nodes[nid] = (ip, port, ts if ts is not None else time.time())
 
     def _is_alive(self, nid):
         if nid not in self.nodes:
@@ -118,7 +163,7 @@ class ChatNode:
                 data = pickle.dumps(message)
                 s.sendall(data)
                 return True
-        except Exception as e:
+        except Exception:
             return False
 
     # ------------------------ join / coord ------------------------
@@ -130,7 +175,9 @@ class ChatNode:
             'type': 'JOIN_REQUEST',
             'ip': self.local_ip,
             'tcp_port': self.tcp_port,
-            'timestamp': time.time()
+            'timestamp': time.time(),
+            'desired_id': self.desired_id,   # tentar recuperar o mesmo node_id
+            'node_uuid': self.node_uuid
         }
         self.send_multicast(join_request)
 
@@ -149,9 +196,11 @@ class ChatNode:
     def become_coordinator(self):
         self.is_coordinator = True
         self.node_id = 1
+        self._save_state()
         self.coordinator_id = self.node_id
         self.coordinator_addr = (self.local_ip, self.tcp_port)
         self.nodes[self.node_id] = (self.local_ip, self.tcp_port, time.time())
+        self.last_owner[self.node_id] = self.node_uuid
 
         print(f"\n{'='*50}")
         print(f"[COORDENADOR] Eu sou o coordenador (Node {self.node_id})")
@@ -202,57 +251,90 @@ class ChatNode:
                 if self.running:
                     print(f"[ERRO] Erro ao processar multicast: {e}")
 
+    def _coordinator_prune_before_assign(self):
+        # libera IDs “mortos” antes de conceder (faxina leve)
+        now = time.time()
+        to_remove = []
+        for nid, (ip, port, last_seen) in list(self.nodes.items()):
+            if nid == self.node_id:
+                continue
+            if (now - last_seen) > self.peer_timeout:
+                to_remove.append((nid, ip, port))
+        for nid, ip, port in to_remove:
+            if nid in self.nodes:
+                del self.nodes[nid]
+                print(f"[{self._now_str()}][COORD] Peer inativo removido: Node {nid} ({ip}:{port})")
+                self.send_multicast({'type': 'NODE_EXIT', 'node_id': nid, 'timestamp': time.time()})
+
     def handle_join_request(self, message):
         if not self.is_coordinator:
             return
 
-        new_id = max(self.nodes.keys()) + 1 if self.nodes else 1
-        new_ip = message['ip']
-        new_port = message['tcp_port']
+        self._coordinator_prune_before_assign()
+
+        desired = message.get("desired_id")
+        req_uuid = message.get("node_uuid")
+        new_ip   = message["ip"]
+        new_port = message["tcp_port"]
+
+        # tenta conceder desired_id se livre (ou antigo dono)
+        can_assign_desired = False
+        if desired and isinstance(desired, int) and desired > 0 and (desired not in self.nodes):
+            owner_ok = (self.last_owner.get(desired) in (None, req_uuid))
+            if owner_ok:
+                new_id = desired
+                can_assign_desired = True
+
+        if not can_assign_desired:
+            new_id = max(self.nodes.keys()) + 1 if self.nodes else 1
 
         self.nodes[new_id] = (new_ip, new_port, time.time())
-        print(f"[{self._now_str()}][COORD] Novo nó entrando: Node {new_id} ({new_ip}:{new_port})")
+        self.last_owner[new_id] = req_uuid
+
+        print(f"[{self._now_str()}][COORD] Nó entrando: Node {new_id} ({new_ip}:{new_port})"
+              + (f" (reclamando ID antigo {desired})" if can_assign_desired else ""))
 
         join_response = {
-            'type': 'JOIN_RESPONSE',
-            'node_id': new_id,
-            'coordinator_id': self.coordinator_id,
-            'coordinator_ip': self.local_ip,
-            'coordinator_port': self.tcp_port,
-            'nodes': {nid: (ip, port, ts) for nid, (ip, port, ts) in self.nodes.items()},
-            'message_history': self.message_history
+            "type": "JOIN_RESPONSE",
+            "node_id": new_id,
+            "coordinator_id": self.coordinator_id,
+            "coordinator_ip": self.local_ip,
+            "coordinator_port": self.tcp_port,
+            "nodes": {nid: (ip, port, ts) for nid, (ip, port, ts) in self.nodes.items()},
+            "message_history": self.message_history
         }
-        # tenta TCP; se falhar, remove a inscrição recém-criada
         if not self.send_tcp(new_ip, new_port, join_response):
             del self.nodes[new_id]
-            print(f"[{self._now_str()}][COORD] Falha ao concluir JOIN com Node {new_id}, revertendo.")
+            print(f"[{self._now_str()}][COORD] Falha no JOIN com Node {new_id}, revertendo.")
             return
 
-        announcement = {
-            'type': 'NODE_JOINED',
-            'node_id': new_id,
-            'ip': new_ip,
-            'port': new_port,
-            'timestamp': time.time()
-        }
-        self.send_multicast(announcement)
+        self.send_multicast({
+            "type": "NODE_JOINED",
+            "node_id": new_id,
+            "ip": new_ip,
+            "port": new_port,
+            "timestamp": time.time()
+        })
 
     def handle_coordinator_announcement(self, message):
         self.coordinator_id = message['coordinator_id']
         self.coordinator_addr = (message['coordinator_ip'], message['coordinator_port'])
         self.last_heartbeat = time.time()
         if 'nodes' in message:
-            for nid_str, (ip, port, _) in message['nodes'].items():
-                nid = int(nid_str) if isinstance(nid_str, str) else int(nid_str)
-                self.nodes[nid] = (ip, port, time.time())
+            # usar ts enviado, não time.time()
+            for nid_key, triple in message['nodes'].items():
+                nid = int(nid_key) if isinstance(nid_key, str) else int(nid_key)
+                ip, port, ts = triple
+                self.nodes[nid] = (ip, port, float(ts))
 
     def handle_heartbeat(self, message):
         if message.get('coordinator_id') == self.coordinator_id:
             self.last_heartbeat = time.time()
             if 'nodes' in message:
-                for nid_str, (ip, port, _) in message['nodes'].items():
-                    nid = int(nid_str) if isinstance(nid_str, str) else int(nid_str)
-                    self.nodes[nid] = (ip, port, time.time())
+                for nid_key, triple in message['nodes'].items():
+                    nid = int(nid_key) if isinstance(nid_key, str) else int(nid_key)
+                    ip, port, ts = triple
+                    self.nodes[nid] = (ip, port, float(ts))
 
     def handle_node_joined(self, message):
         nid = int(message.get('node_id'))
@@ -276,7 +358,7 @@ class ChatNode:
         nid = int(message.get('node_id'))
         ip = message.get('ip')
         port = int(message.get('port'))
-        # se não conhecia, adiciona “passivamente”
+        # se não conhecia, adiciona passivamente; se conhecia, atualiza last_seen
         if nid not in self.nodes:
             self.nodes[nid] = (ip, port, time.time())
         else:
@@ -332,11 +414,13 @@ class ChatNode:
 
     def handle_join_response(self, message):
         self.node_id = message['node_id']
+        self._save_state()
         self.coordinator_id = message['coordinator_id']
         self.coordinator_addr = (message['coordinator_ip'], message['coordinator_port'])
-        for nid_str, (ip, port, _) in message['nodes'].items():
-            nid = int(nid_str) if isinstance(nid_str, str) else int(nid_str)
-            self.nodes[nid] = (ip, port, time.time())
+        for nid_key, triple in message['nodes'].items():
+            nid = int(nid_key) if isinstance(nid_key, str) else int(nid_key)
+            ip, port, ts = triple
+            self.nodes[nid] = (ip, port, float(ts))
         with self.message_lock:
             self.message_history = message.get('message_history', [])
         self.last_heartbeat = time.time()
@@ -349,6 +433,7 @@ class ChatNode:
             if not any(m['sender_id'] == message['sender_id'] and m['timestamp'] == message['timestamp']
                        for m in self.message_history):
                 self.message_history.append(message)
+                self._append_history_local(message)
                 sender_id = message['sender_id']
                 text = message['text']
                 timestamp = datetime.fromtimestamp(message['timestamp']).strftime('%H:%M:%S')
@@ -373,6 +458,7 @@ class ChatNode:
                 if not any(m['sender_id'] == msg['sender_id'] and m['timestamp'] == msg['timestamp']
                            for m in self.message_history):
                     self.message_history.append(msg)
+                    self._append_history_local(msg)
             self.message_history.sort(key=lambda x: x['timestamp'])
 
     # ------------------------ heartbeats / peers / election ------------------------
@@ -468,7 +554,6 @@ class ChatNode:
             wait_until = time.time() + self.wait_new_coordinator
             while self.election_in_progress and time.time() < wait_until:
                 time.sleep(0.2)
-            # Se ainda em progresso, tenta novamente (os “superiores” podem ter caído)
             if self.election_in_progress:
                 print("[ELEIÇÃO] Nenhum COORDINATOR anunciado no prazo. Vou tentar vencer.")
                 self.win_election()
@@ -477,10 +562,8 @@ class ChatNode:
         sender_id = int(message['sender_id'])
         election_id = message.get('election_id', '')
         if not election_id:
-            # compatibilidade, evita loop de OK sem round id
             election_id = f"legacy-{sender_id}"
 
-        # responde OK somente 1x por round
         if election_id in self.seen_elections:
             return
 
@@ -494,13 +577,11 @@ class ChatNode:
             }
             self.send_multicast(ok_msg)
             self.seen_elections.add(election_id)
-            # inicia minha própria eleição, se não estiver em uma
             if not self.election_in_progress:
                 print(f"[ELEIÇÃO] Recebi eleição de Node {sender_id}, iniciando minha própria.")
                 threading.Thread(target=self.start_election, daemon=True).start()
 
     def handle_election_ok(self, message):
-        # aceita OK somente se for da eleição corrente
         if not self.election_in_progress:
             return
         if message.get('election_id') != self.current_election_id:
@@ -540,9 +621,10 @@ class ChatNode:
         self.is_coordinator = (new_coord_id == self.node_id)
         self.election_in_progress = False
         if 'nodes' in message:
-            for nid_str, (ip, port, _) in message['nodes'].items():
-                nid = int(nid_str) if isinstance(nid_str, str) else int(nid_str)
-                self.nodes[nid] = (ip, port, time.time())
+            for nid_key, triple in message['nodes'].items():
+                nid = int(nid_key) if isinstance(nid_key, str) else int(nid_key)
+                ip, port, ts = triple
+                self.nodes[nid] = (ip, port, float(ts))
 
     def sync_history_with_peers(self):
         for node_id, (ip, port, _) in list(self.nodes.items()):
@@ -563,12 +645,10 @@ class ChatNode:
         }
         with self.message_lock:
             self.message_history.append(message)
+            self._append_history_local(message)
         for node_id, (ip, port, _) in list(self.nodes.items()):
             if node_id != self.node_id:
-                ok = self.send_tcp(ip, port, message)
-                if not ok and self.is_coordinator:
-                    # se não consigo entregar, marco como possivelmente morto; faxina cuidará
-                    pass
+                _ = self.send_tcp(ip, port, message)
 
     def show_status(self):
         self._prune_stale_nodes_local()
@@ -579,11 +659,12 @@ class ChatNode:
         print(f"Meu IP: {self.local_ip}:{self.tcp_port}")
         print(f"Coordenador: Node {self.coordinator_id} {'(EU)' if self.is_coordinator else ''}")
         print(f"Nós ativos: {len(self.nodes)}")
+        now = time.time()
         for nid, (ip, port, last_seen) in sorted(self.nodes.items()):
             marker = " (EU)" if nid == self.node_id else ""
             marker += " (COORD)" if nid == self.coordinator_id else ""
             last = datetime.fromtimestamp(last_seen).strftime('%H:%M:%S')
-            alive = "OK" if (time.time() - last_seen) <= self.peer_timeout else "STALE"
+            alive = "OK" if (now - last_seen) <= self.peer_timeout else "STALE"
             print(f"  - Node {nid}: {ip}:{port}{marker}  [visto: {last} | {alive}]")
         print(f"Mensagens no histórico: {len(self.message_history)}")
         print(f"{'='*60}\n")
